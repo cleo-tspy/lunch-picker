@@ -46,7 +46,7 @@ from urllib.parse import quote_plus
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
-from linebot.models import FlexSendMessage, CarouselContainer, BubbleContainer
+from linebot.models import FlexSendMessage, CarouselContainer, BubbleContainer, PostbackEvent
 
 from collections import defaultdict
 from linebot.models import QuickReply, QuickReplyButton, MessageAction
@@ -309,12 +309,22 @@ BASE_BUBBLE = {
         "contents": [
             {
                 "type": "button",
-                "style": "link",
+                "style": "primary",
                 "height": "sm",
                 "action": {
                     "type": "uri",
                     "label": "GOOGLE MAP",
                     "uri": "https://www.google.com/maps"
+                }
+            },
+            {
+                "type": "button",
+                "style": "secondary",
+                "height": "sm",
+                "action": {
+                    "type": "postback",
+                    "label": "就吃這家",
+                    "data": "CHOSEN_PLACE_ID"
                 }
             }
         ],
@@ -374,6 +384,9 @@ def build_bubble(
                 f"&query_place_id={place_id}"
             )
     bubble["footer"]["contents"][0]["action"]["uri"] = maps_uri
+
+    # Replace placeholder postback data in embedded button
+    bubble["footer"]["contents"][1]["action"]["data"] = f"chosen:{place_id}"
 
     return BubbleContainer.new_from_json_dict(bubble)
 
@@ -460,6 +473,46 @@ def handle_text(event: MessageEvent):
             TextSendMessage(text="輸入『午餐』開始選，或『搜尋 關鍵字』直接找！")
         )
 # ------------------ Query / Reply helpers -----------------------------------
+
+
+# --- 處理 PostbackEvent，寫入 user_history ---
+@handler.add(PostbackEvent)
+def handle_postback(event: PostbackEvent):
+    data = event.postback.data
+    user_id = event.source.user_id
+    if data.startswith("chosen:"):
+        place_id = data.split(":", 1)[1]
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            # Check whether today already has a record for this user
+            cur.execute(
+                "SELECT place_id FROM user_history "
+                "WHERE user_id=? AND date(chosen_at)=date('now','localtime')",
+                (user_id,)
+            )
+            row = cur.fetchone()
+            if row and row[0] == place_id:
+                # Same place already recorded today; ignore duplicate
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text="記錄過了！")
+                )
+                return
+            # Otherwise, replace today's previous choice (if any) with the new one
+            cur.execute(
+                "DELETE FROM user_history WHERE user_id=? AND date(chosen_at)=date('now','localtime')",
+                (user_id,)
+            )
+            cur.execute(
+                "INSERT INTO user_history (user_id, place_id, chosen_at) VALUES (?,?,?)",
+                (user_id, place_id, datetime.utcnow().isoformat())
+            )
+            conn.commit()
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="已記錄！祝用餐愉快 😋")
+        )
+        return
 
 def query_places(keyword: str | None = None,
                  category: str | None = None,
