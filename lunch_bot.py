@@ -57,7 +57,18 @@ logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(m
 user_session: defaultdict[str, dict] = defaultdict(dict)
 TTL = timedelta(minutes=10)
 
+
 budget_map = {"$": 1, "$$": 2, "$$$": 3}
+
+# 中文餐廳類型 → Google Places `types` 對映
+category_map = {
+    "飯": "restaurant",          # 泛指有飯類主食
+    "麵": "meal_takeaway",       # 便當/麵食
+    "咖啡": "cafe",
+    "小吃": "street_food",
+    "便當": "meal_takeaway",
+    "不限": None,                # 不設定過濾
+}
 
 
 # --------------------------- Config -----------------------------------------
@@ -122,6 +133,14 @@ def init_db() -> None:
 GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 PLACES_URL = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
 
+# 針對多個餐飲相關類型輪詢，避免單次 API 只回 restaurant 導致遺漏
+TYPES_OF_INTEREST = [
+    "restaurant",
+    "meal_takeaway",
+    "cafe",
+    "street_food",
+]
+
 def _safe_get(url: str, **params) -> dict[str, Any]:
     resp = requests.get(url, params=params, timeout=10)
     resp.raise_for_status()
@@ -139,28 +158,46 @@ def geocode_plus_code(plus_code: str) -> Tuple[float, float]:
     raise RuntimeError("Geocoding failed and no fallback coordinates provided.")
 
 def fetch_places(lat: float, lng: float) -> List[dict[str, Any]]:
-    params = {
+    """
+    Fetch places within radius for all TYPES_OF_INTEREST, handling up to 3 pages
+    per type. Deduplicate by place_id so the same店家不會重複。
+    """
+    seen: dict[str, dict[str, Any]] = {}
+    base_params = {
         "key": GOOGLE_KEY,
         "location": f"{lat},{lng}",
         "radius": RADIUS_METERS,
-        "type": "restaurant|food",
         "language": "zh-TW",
     }
-    results: List[dict[str, Any]] = []
-    while True:
-        payload = _safe_get(PLACES_URL, **params)
-        status = payload.get("status")
-        if status not in {"OK", "ZERO_RESULTS"}:
-            raise RuntimeError(f"Places API error: {status} – {payload.get('error_message')}")
-        results.extend(payload.get("results", []))
-        token = payload.get("next_page_token")
-        if token:
-            params = {"pagetoken": token, "key": GOOGLE_KEY}
-            time.sleep(2)
-        else:
-            break
-    logging.info("Fetched %d places from Google.", len(results))
-    return results
+
+    for t in TYPES_OF_INTEREST:
+        params = base_params | {"type": t}
+        page = 1
+        while True:
+            payload = _safe_get(PLACES_URL, **params)
+            status = payload.get("status")
+            if status not in {"OK", "ZERO_RESULTS"}:
+                raise RuntimeError(f"Places API error: {status} – {payload.get('error_message')}")
+
+            for place in payload.get("results", []):
+                # keep only places that match at least one food-related type
+                if any(tt in TYPES_OF_INTEREST for tt in place.get("types", [])):
+                    seen.setdefault(place["place_id"], place)
+                else:
+                    logging.debug("Skip non-food place: %s (%s)",
+                                  place.get("name"), place.get("types"))
+
+            token = payload.get("next_page_token")
+            if token and page < 3:  # Google API 最多 3 頁
+                params = {"pagetoken": token, "key": GOOGLE_KEY}
+                page += 1
+                time.sleep(2)      # token 需要 2s 才可用
+            else:
+                break
+        logging.info("Type %-15s ⇒ %3d results (page %d)", t, len(seen), page)
+
+    logging.info("Fetched %d unique places (all types).", len(seen))
+    return list(seen.values())
 
 # ---------------------- Data persistence ------------------------------------
 
@@ -416,7 +453,6 @@ def purge_expired_sessions():
             user_session.pop(uid, None)
 
 @handler.add(MessageEvent, message=TextMessage)
-@handler.add(MessageEvent, message=TextMessage)
 def handle_text(event: MessageEvent):
     purge_expired_sessions()
     user_id = event.source.user_id
@@ -437,8 +473,11 @@ def handle_text(event: MessageEvent):
 
     # --- B. 使用者選了類型 ---
     if text.startswith("類型:"):
-        category = text.split(":", 1)[1]
-        user_session[user_id].update({"category": category, "ts": datetime.utcnow()})
+        zh_cat = text.split(":", 1)[1]
+        type_key = category_map.get(zh_cat)
+        user_session[user_id].update(
+            {"category": zh_cat, "type_key": type_key, "ts": datetime.utcnow()}
+        )
 
 
         # 接著詢問預算
@@ -448,7 +487,7 @@ def handle_text(event: MessageEvent):
         ])
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text=f"已選「{category}」，預算多少？", quick_reply=q_budget)
+            TextSendMessage(text=f"已選「{zh_cat}」，預算多少？", quick_reply=q_budget)
         )
         return
 
@@ -515,9 +554,10 @@ def handle_postback(event: PostbackEvent):
         return
 
 def query_places(keyword: str | None = None,
-                 category: str | None = None,
+                 zh_category: str | None = None,
                  price_max: int | None = None,
-                 exclude_ids: set[str] | None = None):
+                 exclude_ids: set[str] | None = None,
+                 type_key: str | None = None):
     sql = """SELECT place_id, name, rating, address, lat, lng, open_now, opening_hours, photo_ref
              FROM places"""
     cond, params = [], []
@@ -527,10 +567,13 @@ def query_places(keyword: str | None = None,
         cond.append("(name LIKE ? OR address LIKE ?)")
         params += [f"%{keyword}%"] * 2
 
-    # 類型（中文關鍵字）
-    if category and category != "不限":
+    # 類型過濾：若有 type_key (英文) 則用 types LIKE，否則退回中文關鍵字比對
+    if type_key:
+        cond.append("types LIKE ?")
+        params.append(f"%{type_key}%")
+    elif zh_category and zh_category != "不限":
         cond.append("(name LIKE ? OR address LIKE ?)")
-        params += [f"%{category}%"] * 2
+        params += [f"%{zh_category}%"] * 2
 
     # 預算
     if price_max:
@@ -544,9 +587,6 @@ def query_places(keyword: str | None = None,
 
     if cond:
         sql += " WHERE " + " AND ".join(cond)
-    # exclude recent 3‑day choices
-    if "exclude_ids" in locals():
-        pass
     sql += " ORDER BY rating DESC NULLS LAST, user_ratings_total DESC LIMIT 5"
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -564,10 +604,12 @@ def reply_best(event: MessageEvent, keyword: str | None = None):
     exclude_ids = recent_place_ids(user_id)
     sess = user_session.get(user_id, {})
     category = sess.get("category")
+    type_key = sess.get("type_key")
     budget   = sess.get("budget")
     price_max = budget_map.get(budget) if budget else None
 
-    rows = query_places(keyword, category, price_max, exclude_ids=exclude_ids)
+    rows = query_places(keyword, category, price_max,
+                        exclude_ids=exclude_ids, type_key=type_key)
 
     # 用完就清 session
     user_session.pop(user_id, None)
