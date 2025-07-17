@@ -51,7 +51,7 @@
 | S1-1 | *Quick Reply*（類型／預算） | ✔ 完成 | 按鈕多步選擇 |
 | S1-2 | *Session* 暫存 | ✔ 完成 | 記住類型、預算直到查詢 |
 | S1-3 | 篩選查詢串接 | ✔ 完成 | `query_places()` 傳入類型/price |
-| S1-4 | **Flex Message Bubble/Carousel** | ⏳ 進行中 | 美觀卡片 + 「導航」按鈕 |
+| S1-4 | **Flex Message Bubble/Carousel** | ✔ 完成 | 美觀卡片 + 導航按鈕；Hero 圖手機端正常，桌機端暫以佔位圖 |
 | S1-5 | Session TTL 10 min | 🔜 | 逾時自動清除 |
 | S1-6 | README GIF Demo | 🔜 | 示範「午餐 → 類型 → 預算 → Flex 列表」|
 | S1-7 | 偏好帶入 + 去重 | 🔜 | 讀取 `users` 備註，推薦時避開三日內已選餐廳 |
@@ -110,6 +110,7 @@
 |------|------|------|
 | 2025-07-16 | Quick Reply + 篩選上線 | S1-1 〜 S1-3 完成 |
 | 2025-07-16 | Roadmap 改版 v2 | 新結構 / 詳述 |
+| 2025-07-17 | Flex Bubble/Carousel 完成 | S1-4 完成，已切換 Flex 回覆 |
 
 ---
 
