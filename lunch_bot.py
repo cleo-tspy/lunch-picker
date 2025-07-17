@@ -38,22 +38,25 @@ from typing import Any, List, Tuple
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, abort, request
+import copy
+from datetime import datetime, timedelta
+from urllib.parse import quote_plus
 
-# --- LINE BOT SDK (v2) -------------------------------------------------------
-try:
-    from linebot import LineBotApi, WebhookHandler
-    from linebot.exceptions import InvalidSignatureError
-    from linebot.models import MessageEvent, TextMessage, TextSendMessage
-except ImportError:
-    raise RuntimeError("Please install line-bot-sdk==2.* for this sample.")
+# --- LINE BOT SDK -------------------------------------------------------
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import FlexSendMessage, CarouselContainer, BubbleContainer
 
 from collections import defaultdict
 from linebot.models import QuickReply, QuickReplyButton, MessageAction
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # 簡易記憶體 session（程式重啟會清空）
 user_session: defaultdict[str, dict] = defaultdict(dict)
+TTL = timedelta(minutes=10)
+
 budget_map = {"$": 1, "$$": 2, "$$$": 3}
 
 
@@ -89,18 +92,29 @@ def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """CREATE TABLE IF NOT EXISTS places (
-                   place_id TEXT PRIMARY KEY,
-                   name TEXT,
-                   address TEXT,
-                   lat REAL,
-                   lng REAL,
-                   price_level INTEGER,
-                   rating REAL,
-                   user_ratings_total INTEGER,
-                   types TEXT,
-                   first_seen TEXT,
-                   last_seen TEXT
-               )"""
+                place_id TEXT PRIMARY KEY,
+                name TEXT,
+                address TEXT,
+                lat REAL,
+                lng REAL,
+                price_level INTEGER,
+                rating REAL,
+                user_ratings_total INTEGER,
+                types TEXT,
+                open_now INTEGER,
+                opening_hours TEXT,
+                photo_ref TEXT,
+                first_seen TEXT,
+                last_seen TEXT
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS user_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT,
+                place_id TEXT,
+                chosen_at TEXT
+            )"""
         )
         conn.commit()
 
@@ -156,22 +170,47 @@ def upsert_places(places: List[dict[str, Any]]) -> List[str]:
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         for p in places:
+            opening = p.get("opening_hours", {})
+            open_now   = opening.get("open_now")           # bool
+            weekday    = opening.get("weekday_text")       # list
+            opening_txt = "; ".join(weekday) if weekday else None
+
+            photo_ref = None
+            if "photos" in p and p["photos"]:
+                photo_ref = p["photos"][0]["photo_reference"]
+
             data = (
-                p["place_id"], p["name"], p.get("vicinity"),
-                p["geometry"]["location"]["lat"], p["geometry"]["location"]["lng"],
-                p.get("price_level"), p.get("rating"), p.get("user_ratings_total"),
+                p["place_id"],
+                p["name"],
+                p.get("vicinity"),
+                p["geometry"]["location"]["lat"],
+                p["geometry"]["location"]["lng"],
+                p.get("price_level"),
+                p.get("rating"),
+                p.get("user_ratings_total"),
                 ",".join(p.get("types", [])),
+                int(open_now) if open_now is not None else None,
+                opening_txt,
+                photo_ref,
             )
             try:
                 cur.execute(
                     """INSERT INTO places
-                       (place_id,name,address,lat,lng,price_level,rating,user_ratings_total,types,first_seen,last_seen)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                       (place_id,name,address,lat,lng,price_level,rating,
+                        user_ratings_total,types,open_now,opening_hours,photo_ref,
+                        first_seen,last_seen)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (*data, now, now),
                 )
                 new_names.append(p["name"])
             except sqlite3.IntegrityError:
-                cur.execute("UPDATE places SET last_seen=? WHERE place_id=?", (now, p["place_id"]))
+                cur.execute(
+                    """UPDATE places SET
+                       last_seen=?, open_now=?, opening_hours=?, photo_ref=?
+                       WHERE place_id=?""",
+                    (now, int(open_now) if open_now is not None else None,
+                     opening_txt, photo_ref, p["place_id"])
+                )
         conn.commit()
     return new_names
 
@@ -196,6 +235,148 @@ def daily_refresh() -> None:
 
 scheduler.add_job(daily_refresh, "cron", hour=10, minute=0, id="daily_refresh")
 
+# -------------------- LINE build_bubble --------------------------------- 
+# ---------- Star icon URLs ----------
+GOLD_STAR = "https://developers-resource.landpress.line.me/fx/img/review_gold_star_28.png"
+GRAY_STAR = "https://developers-resource.landpress.line.me/fx/img/review_gray_star_28.png"
+PLACEHOLDER_URL = "https://raw.githubusercontent.com/cleo-tspy/lunch-picker/main/static/lunch_placeholder.jpg"
+# ---------- Base Bubble template ----------
+BASE_BUBBLE = {
+    "type": "bubble",
+    "hero": {
+        "type": "image",
+        # 會在 build_bubble 時覆寫
+        "url": PLACEHOLDER_URL,
+        "size": "full",
+        "aspectRatio": "20:13",
+        "aspectMode": "cover"
+    },
+    "body": {
+        "type": "box",
+        "layout": "vertical",
+        "contents": [
+            {  # 店名
+                "type": "text",
+                "text": "店名",
+                "weight": "bold",
+                "size": "xl"
+            },
+            {  # 星星列 & 評分
+                "type": "box",
+                "layout": "baseline",
+                "margin": "md",
+                "contents": [
+                    # 五顆 star icon，稍後依評分改 URL
+                    *(
+                        {"type": "icon", "size": "sm", "url": GOLD_STAR}
+                        for _ in range(5)
+                    ),
+                    {
+                        "type": "text",
+                        "text": "★ 4.8",
+                        "size": "sm",
+                        "color": "#999999",
+                        "margin": "md",
+                        "flex": 0
+                    }
+                ]
+            },
+            {  # 地址
+                "type": "box",
+                "layout": "baseline",
+                "margin": "lg",
+                "spacing": "sm",
+                "contents": [
+                    {"type": "text", "text": "地址", "color": "#aaaaaa", "size": "sm", "flex": 1},
+                    {"type": "text", "text": "台中市西屯區...", "wrap": True, "color": "#666666", "size": "sm", "flex": 5}
+                ]
+            },
+            {  # 營業狀態
+                "type": "box",
+                "layout": "baseline",
+                "spacing": "sm",
+                "contents": [
+                    {"type": "text", "text": "營業", "color": "#aaaaaa", "size": "sm", "flex": 1},
+                    {"type": "text", "text": "營業中 11:00–22:00", "wrap": True, "color": "#666666", "size": "sm", "flex": 5}
+                ]
+            }
+        ]
+    },
+    "footer": {
+        "type": "box",
+        "layout": "vertical",
+        "spacing": "sm",
+        "contents": [
+            {
+                "type": "button",
+                "style": "link",
+                "height": "sm",
+                "action": {
+                    "type": "uri",
+                    "label": "GOOGLE MAP",
+                    "uri": "https://www.google.com/maps"
+                }
+            }
+        ],
+        "flex": 0
+    }
+}
+
+def build_bubble(
+    place_id: str,
+    name: str,
+    rating: float | None,
+    address: str,
+    lat: float,
+    lng: float,
+    open_now: bool | None = None,
+    opening_hours: str | None = None,
+    photo_url: str | None = None,
+):
+    """
+    Return Flex BubbleContainer with dynamic data.
+    - open_now: True/False/None  → 營業中 / 已打烊 / 未提供
+    - opening_hours: e.g. '11:00–22:00'
+    """
+
+    bubble = copy.deepcopy(BASE_BUBBLE)
+
+    # 1. 圖片
+    bubble["hero"]["url"] = photo_url or PLACEHOLDER_URL
+
+    # 2. 店名
+    bubble["body"]["contents"][0]["text"] = name
+
+    # 3. 星星 icon + 評分文字
+    gold = min(int(round(rating or 0)), 5)
+    for i in range(5):
+        icon_url = GOLD_STAR if i < gold else GRAY_STAR
+        bubble["body"]["contents"][1]["contents"][i]["url"] = icon_url
+    bubble["body"]["contents"][1]["contents"][-1]["text"] = f"★ {rating:.1f}" if rating else "★ N/A"
+
+    # 4. 地址
+    bubble["body"]["contents"][2]["contents"][1]["text"] = address
+
+    # 5. 營業狀態 & 時間
+    status_text = "未提供"
+    if open_now is True:
+        status_text = "營業中"
+    elif open_now is False:
+        status_text = "已打烊"
+    if opening_hours:
+        status_text += f" {opening_hours}"
+    bubble["body"]["contents"][3]["contents"][1]["text"] = status_text
+
+    # 6. Google Maps 導航
+    maps_uri = (
+                "https://www.google.com/maps/search/?api=1"
+                f"&query={quote_plus(name)}"
+                f"&query_place_id={place_id}"
+            )
+    bubble["footer"]["contents"][0]["action"]["uri"] = maps_uri
+
+    return BubbleContainer.new_from_json_dict(bubble)
+
 # -------------------- LINE webhook handlers ---------------------------------
 
 @app.route("/callback", methods=["POST"])
@@ -215,12 +396,19 @@ def index():
     return "OK", 200
 
 
+def purge_expired_sessions():
+    now = datetime.utcnow()
+    for uid in list(user_session.keys()):
+        if now - user_session[uid].get("ts", now) > TTL:
+            user_session.pop(uid, None)
+
 @handler.add(MessageEvent, message=TextMessage)
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event: MessageEvent):
+    purge_expired_sessions()
     user_id = event.source.user_id
     text = event.message.text.strip()
-
+    logging.debug("USER_ID=%s", event.source.user_id)
     # --- A. 啟動流程 ---
     if text in {"午餐", "午餐?", "午餐？"}:
         # <第一階段> 只給「類型」選擇
@@ -237,7 +425,8 @@ def handle_text(event: MessageEvent):
     # --- B. 使用者選了類型 ---
     if text.startswith("類型:"):
         category = text.split(":", 1)[1]
-        user_session[user_id]["category"] = category
+        user_session[user_id].update({"category": category, "ts": datetime.utcnow()})
+
 
         # 接著詢問預算
         q_budget = QuickReply(items=[
@@ -253,7 +442,7 @@ def handle_text(event: MessageEvent):
     # --- C. 使用者選了預算 ---
     if text.startswith("預算:"):
         budget = text.split(":", 1)[1]
-        user_session[user_id]["budget"] = budget
+        user_session[user_id].update({"budget": budget, "ts": datetime.utcnow()})
 
         # 兩欄都齊全 → 立即推薦
         reply_best(event)
@@ -274,8 +463,10 @@ def handle_text(event: MessageEvent):
 
 def query_places(keyword: str | None = None,
                  category: str | None = None,
-                 price_max: int | None = None):
-    sql = "SELECT name, rating, address FROM places"
+                 price_max: int | None = None,
+                 exclude_ids: set[str] | None = None):
+    sql = """SELECT place_id, name, rating, address, lat, lng, open_now, opening_hours, photo_ref
+             FROM places"""
     cond, params = [], []
 
     # 關鍵字
@@ -293,33 +484,79 @@ def query_places(keyword: str | None = None,
         cond.append("price_level<=?")
         params.append(price_max)
 
+    if exclude_ids:
+        placeholders = ",".join("?" for _ in exclude_ids)
+        cond.append(f"place_id NOT IN ({placeholders})")
+        params.extend(exclude_ids)
+
     if cond:
         sql += " WHERE " + " AND ".join(cond)
+    # exclude recent 3‑day choices
+    if "exclude_ids" in locals():
+        pass
     sql += " ORDER BY rating DESC NULLS LAST, user_ratings_total DESC LIMIT 5"
 
     with sqlite3.connect(DB_PATH) as conn:
         return conn.execute(sql, params).fetchall()
 
+# Helper: fetch recent choices
+def recent_place_ids(user_id: str, days: int = 3) -> set[str]:
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    sql = "SELECT place_id FROM user_history WHERE user_id=? AND chosen_at>=?"
+    with sqlite3.connect(DB_PATH) as conn:
+        return {row[0] for row in conn.execute(sql, (user_id, cutoff))}
+
 def reply_best(event: MessageEvent, keyword: str | None = None):
     user_id = event.source.user_id
+    exclude_ids = recent_place_ids(user_id)
     sess = user_session.get(user_id, {})
     category = sess.get("category")
     budget   = sess.get("budget")
     price_max = budget_map.get(budget) if budget else None
 
-    rows = query_places(keyword, category, price_max)
+    rows = query_places(keyword, category, price_max, exclude_ids=exclude_ids)
 
-    # 查完就清掉 session，避免下次殘留
+    # 用完就清 session
     user_session.pop(user_id, None)
 
     if not rows:
-        msg = "找不到符合條件的餐廳 🥲"
-    else:
-        msg = "\n\n".join(
-            f"{name} ({rating if rating else 'N/A'}⭐)\n{addr}"
-            for name, rating, addr in rows
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="找不到符合條件的餐廳 🥲")
         )
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        return
+
+    # --- 1) 把每一筆資料轉成 Bubble ---
+    bubbles: list[BubbleContainer] = []
+    for row in rows:
+        (place_id, name, rating, address,
+        lat, lng,
+        open_now, opening_hours, photo_ref) = row
+
+        photo_url = (f"https://maps.googleapis.com/maps/api/place/photo"
+                    f"?maxwidth=240&photoreference={photo_ref}&key={GOOGLE_KEY}"
+                    if photo_ref else PLACEHOLDER_URL)
+
+        # TODO: When user explicitly selects a restaurant, insert into user_history.
+
+        bubbles.append(
+            build_bubble(
+                place_id=place_id,
+                name=name,
+                rating=rating,
+                address=address,
+                lat=lat,
+                lng=lng,
+                open_now=bool(open_now) if open_now is not None else None,
+                opening_hours=opening_hours,
+                photo_url=photo_url
+            )
+        )
+
+    # --- 2) 組成 Carousel & 發送 Flex ---
+    carousel = CarouselContainer(contents=bubbles)
+    flex_msg = FlexSendMessage(alt_text="午餐推薦", contents=carousel)
+    line_bot_api.reply_message(event.reply_token, flex_msg)
 
 # --------------------------- Main -------------------------------------------
 

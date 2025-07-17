@@ -52,9 +52,11 @@
 | S1-2 | *Session* 暫存 | ✔ 完成 | 記住類型、預算直到查詢 |
 | S1-3 | 篩選查詢串接 | ✔ 完成 | `query_places()` 傳入類型/price |
 | S1-4 | **Flex Message Bubble/Carousel** | ✔ 完成 | 美觀卡片 + 導航按鈕；Hero 圖手機端正常，桌機端暫以佔位圖 |
-| S1-5 | Session TTL 10 min | 🔜 | 逾時自動清除 |
-| S1-6 | README GIF Demo | 🔜 | 示範「午餐 → 類型 → 預算 → Flex 列表」|
-| S1-7 | 偏好帶入 + 去重 | 🔜 | 讀取 `users` 備註，推薦時避開三日內已選餐廳 |
+| S1-5 | Session TTL 10 min | ✔ 完成 | 逾時自動清除 |
+| S1-6 | README GIF Demo | ⏸ 延後 | 暫緩製作示範 GIF，待核心功能穩定後再補 |
+| S1-8 | 導航連結優化 | ✔ 完成 | 點「GOOGLE MAP」帶 place_id，Maps 顯示店名 |
+| S1-9 | Budget 條件確認 | ✔ 完成 | price_level <= user_budget 已實作並通過測試 |
+| S1-7 | 偏好帶入 + 去重 | 🟡 進行中 | **三日去重已完成** 推薦時避開三日內已選餐廳；接下來新增「就吃這家」按鈕 |
 
 #### 近期目標（D-1：2025-07-17）
 
@@ -66,41 +68,42 @@
 
 ### 2-3．S2 類別強化（🔜 排程中）
 
-| 子項 | 描述 |
-|------|------|
-| 中文→英文對映 | `"麵"→"meal_takeaway"`, `"咖啡"→"cafe"` … |
-| 抓取 `types` 存表 | DB 加欄 `place_types` |
-| 搜尋指令「便當」 | 自動套用對映後過濾 |
+| 編號 | 子項 | 描述 |
+|------|------|------|
+| S2-1 | 中文→英文對映 | `"麵"→"meal_takeaway"`, `"咖啡"→"cafe"` … |
+| S2-2 | 抓取 `types` 存表 | DB 加欄 `place_types` |
+| S2-3 | 搜尋指令「便當」 | 自動套用對映後過濾 |
+| S2-4 | 進階搜尋條件 | 🔜 | 店名＋類型／菜色關鍵字解析（牛肉麵、咖哩等），與 types 對映整合 |
 
 ---
 
 ### 2-4．S3 回饋機制（🔜）
 
-| 子項 | 描述 |
-|------|------|
-| Flex 卡片加 👍 / 👎 | Postback 回傳 `like` / `dislike` |
-| `favorites`, `blacklist` 表 | 排序優先 or 過濾 |
-| 推薦權重調整 | favorite +2 分，blacklist 排除 |
+| 編號 | 子項 | 描述 |
+|------|------|------|
+| S3-1 | Flex 卡片加 👍 / 👎 | Postback 回傳 `like` / `dislike` ，寫入 favorites/blacklist|
+| S3-2 | `favorites`, `blacklist` 表 | 排序優先 or 過濾 |
+| S3-3 | 推薦權重調整 | favorite +2 分，blacklist 排除 |
 
 ---
 
 ### 2-5．S4 午餐足跡（🔜）
 
-| 子項 | 描述 |
-|------|------|
-| `lunch_log` 表 | 記錄最終選擇 |
-| `/history` 查詢 | 本週去哪吃 |
-| 2 h 後提醒 | APScheduler 個別推「今天吃哪家？」 |
+| 編號 | 子項 | 描述 |
+|------|------|------|
+| S4-1 | `lunch_log` 表 | 記錄最終選擇 |
+| S4-2 | `/history` 查詢 | 本週去哪吃 |
+| S4-3 | 10–13 點延遲詢問機制 | 🔜 | 推薦送出且時段落在 10:00–13:00 時，排 2h Job 主動問「今天最終吃哪家？」；用 Quick Reply `chosen:<place_id>` 回傳後寫入 user_history |
 
 ---
 
 ### 2-6．S5 Gemini AI 加值（🔜）
 
-| 子項 | 描述 |
-|------|------|
-| NLU 意圖抽取 | Gemini functions → `{"keyword":"韓式", "price":200}` |
-| 推薦理由生成 | 在 Flex 卡片加入「推薦理由」 |
-| Metacognition | 每日批次：讀取 `feedback` → 調整排序策略 |
+| 編號 | 子項 | 描述 |
+|------|------|------|
+| S5-1 | NLU 意圖抽取 | Gemini functions → `{"keyword":"韓式", "price":200}` |
+| S5-2 | 推薦理由生成 | 在 Flex 卡片加入「推薦理由」 |
+| S5-3 | Metacognition | 每日批次：讀取 `feedback` → 調整排序策略 |
 
 ---
 
@@ -111,6 +114,10 @@
 | 2025-07-16 | Quick Reply + 篩選上線 | S1-1 〜 S1-3 完成 |
 | 2025-07-16 | Roadmap 改版 v2 | 新結構 / 詳述 |
 | 2025-07-17 | Flex Bubble/Carousel 完成 | S1-4 完成，已切換 Flex 回覆 |
+| 2025-07-17 | Session TTL 完成 | 加自動 purge，每 10 min 時效 |
+| 2025-07-17 | 更新 Roadmap：S1-6 延後；新增 S1-8~10 工作 | 調整下一階段優先級 |
+| 2025-07-17 | 導航連結優化、Budget 條件完成 | S1-8、S1-9 結案 |
+| 2025-07-17 | 三日去重功能完成 | user_history 表 + recent exclusion 生效 |
 
 ---
 
